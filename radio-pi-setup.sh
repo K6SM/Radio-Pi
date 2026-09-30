@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# radio-pi-setup.sh  version 0.5.2  (2026-09-26)
+# radio-pi-setup.sh  version 0.5.3  (2026-09-30)
 #
 # Sets up a Raspberry Pi as the radio-end computer of a remote amateur radio
 # station.
@@ -37,7 +37,7 @@
 # is reported rather than ending the script without a word.
 set -Eeuo pipefail
 
-VERSION="0.5.2"
+VERSION="0.5.3"
 CONF_DIR="/etc/ham-radio-pi"
 CONF_FILE="$CONF_DIR/setup.conf"
 BACKUP_DIR="$CONF_DIR/backups"
@@ -64,10 +64,17 @@ OS_RELEASE_FILE=/etc/os-release
 APT_SOURCES=/etc/apt/sources.list
 APT_SOURCES_D=/etc/apt/sources.list.d
 HAMLIB_PREFIX=/usr/local
+
+# The K6SM Emacs packages. Each is cloned from GitHub into K6SM_SRC, and its
+# .el files -- not its tests -- are copied to ~/.emacs.d/lisp/<repo>/.
+K6SM_REPOS="ham Emacs-QSO-Logger adif-mode"
+K6SM_GITHUB="https://github.com/K6SM"
+K6SM_SRC=/usr/local/src/k6sm
 RIGCTLD_BIN=$HAMLIB_PREFIX/bin/rigctld
 RIGCTL_BIN=$HAMLIB_PREFIX/bin/rigctl
 
 CHANGES=()
+K6SM_REVS=()
 
 # --------------------------------------------------------------------------
 # Output
@@ -407,9 +414,12 @@ fi
 #                    0.5.0's output "staircase" across the screen;
 #   </dev/null and APT_LISTCHANGES_FRONTEND=none  nothing apt starts may stop
 #                    to ask a question or open a pager.
+#   DPkg::Lock::Timeout  if the 3am maintenance is running apt, wait for it
+#                    to finish instead of failing.
 apt_run() {
     DEBIAN_FRONTEND=noninteractive APT_LISTCHANGES_FRONTEND=none \
-        apt-get -o Dpkg::Use-Pty=0 -o Dpkg::Options::=--force-confold "$@" < /dev/null
+        apt-get -o Dpkg::Use-Pty=0 -o Dpkg::Options::=--force-confold \
+                -o DPkg::Lock::Timeout=600 "$@" < /dev/null
 }
 
 # Command-line packages: no recommends, to keep a Lite image lean.
@@ -1007,9 +1017,44 @@ if ask_yn "Install Emacs (terminal build) for use on an attached screen?" "${INS
     INSTALL_EMACS=yes; else INSTALL_EMACS=no; fi
 INSTALL_K6SM=no
 if [ "$INSTALL_EMACS" = yes ]; then
-    if ask_yn "Also fetch the K6SM ham.el and QSO logger packages from GitHub?" \
+    if ask_yn "Also install the K6SM ham.el, QSO logger and ADIF packages from GitHub, updating them on every run?" \
               "${INSTALL_K6SM_DEFAULT:-yes}"; then INSTALL_K6SM=yes; fi
 fi
+
+head_ "Nightly maintenance"
+current_timezone() {
+    local tz=""
+    if have timedatectl; then tz=$(timedatectl show -p Timezone --value 2>/dev/null || true); fi
+    if [ -z "$tz" ] && [ -r /etc/timezone ]; then tz=$(head -1 /etc/timezone); fi
+    if [ -z "$tz" ] && [ -L /etc/localtime ]; then
+        tz=$(readlink /etc/localtime | sed 's|.*/zoneinfo/||')
+    fi
+    printf '%s' "${tz:-UTC}"
+}
+valid_timezone() { [ -n "$1" ] && [ -f "/usr/share/zoneinfo/$1" ]; }
+if [ "$UNATTENDED" = 0 ]; then
+    cat <<'MAINTNOTE'
+   Debian's housekeeping -- package lists, security updates, the manual
+   index, log rotation, trimming the SD card -- runs between 3 and 4am in the
+   station's time zone, one job at a time, so that it never competes with
+   operating. Pi images often come set to London or UTC.
+
+MAINTNOTE
+fi
+while :; do
+    TIMEZONE=$(ask "Time zone of the station, e.g. America/Los_Angeles" \
+                   "${TIMEZONE:-$(current_timezone)}")
+    if valid_timezone "$TIMEZONE"; then break; fi
+    if [ "$UNATTENDED" = 1 ]; then
+        warn "\"$TIMEZONE\" is not a time zone; keeping $(current_timezone)."
+        TIMEZONE=$(current_timezone); break
+    fi
+    say "\"$TIMEZONE\" is not a time zone this Pi knows. Names are Region/City,"
+    say "as listed by: timedatectl list-timezones"
+    TIMEZONE=""
+done
+if ask_yn "Install Debian's security and stable updates automatically, at 3am?" \
+          "${AUTO_UPDATES_DEFAULT:-yes}"; then AUTO_UPDATES=yes; else AUTO_UPDATES=no; fi
 
 # --------------------------------------------------------------------------
 # Save the answers
@@ -1064,6 +1109,12 @@ LED_OFF="$LED_OFF"
 AUTOLOGIN="$AUTOLOGIN"
 INSTALL_EMACS="$INSTALL_EMACS"
 INSTALL_K6SM="$INSTALL_K6SM"
+TIMEZONE="$TIMEZONE"
+AUTO_UPDATES="$AUTO_UPDATES"
+# yes: a maintenance job missed because the Pi was off at 3am runs at the
+# next boot instead of waiting for the next night. For a station switched
+# off overnight, whose maintenance would otherwise never run.
+MAINT_CATCH_UP="${MAINT_CATCH_UP:-no}"
 
 # Defaults for the questions on a re-run.
 DISABLE_BT_DEFAULT="$DISABLE_BT"
@@ -1071,6 +1122,7 @@ LED_OFF_DEFAULT="$LED_OFF"
 AUTOLOGIN_DEFAULT="$AUTOLOGIN"
 INSTALL_EMACS_DEFAULT="$INSTALL_EMACS"
 INSTALL_K6SM_DEFAULT="$INSTALL_K6SM"
+AUTO_UPDATES_DEFAULT="$AUTO_UPDATES"
 WIFI_WATCHDOG_DEFAULT="$WIFI_WATCHDOG"
 WIFI_WATCHDOG_REBOOT_DEFAULT="$WIFI_WATCHDOG_REBOOT"
 CONF
@@ -1083,6 +1135,7 @@ if [ "$SKIP_APT" = 0 ]; then
     head_ "Installing the rest"
     PKGS=(mumble-server avahi-daemon iw rsync sqlite3)
     if [ "$INSTALL_K6SM" = yes ];   then PKGS+=(git); fi
+    if [ "$AUTO_UPDATES" = yes ];   then PKGS+=(unattended-upgrades); fi
     say "${PKGS[*]}"
     apt_install "${PKGS[@]}"
 
@@ -1630,14 +1683,92 @@ systemctl restart systemd-journald >/dev/null 2>&1 || true
 
 # --- services that do nothing here ---------------------------------------
 
-for svc in triggerhappy cups cups-browsed ModemManager packagekit \
-           apt-daily.timer apt-daily-upgrade.timer man-db.timer \
-           e2scrub_all.timer fstrim.timer; do
-    if systemctl list-unit-files "$svc" 2>/dev/null | grep -q "^$svc"; then
+unit_exists() { [ -n "$(systemctl list-unit-files --no-legend "$1" 2>/dev/null || true)" ]; }
+
+for svc in triggerhappy cups cups-browsed ModemManager packagekit; do
+    if unit_exists "$svc"; then
         systemctl disable --now "$svc" >/dev/null 2>&1 || true
         note "disabled   $svc"
     fi
 done
+
+# --- nightly maintenance ----------------------------------------------------
+
+# Debian's housekeeping runs on systemd timers, by default at random times
+# through the day, and catches up at boot on anything it missed -- which is
+# just when an operator is likely to be on the air, and on a Zero 2W a package
+# update is heard in the audio. Here each job runs between 3 and 4am, one at
+# a time, and the heavy ones do not catch up: a Pi that was off at 3am waits
+# for the next night. (Before 0.5.3 this script turned several of them off.)
+if [ "$(current_timezone)" != "$TIMEZONE" ]; then
+    if timedatectl set-timezone "$TIMEZONE" 2>/dev/null; then :; else
+        ln -sf "/usr/share/zoneinfo/$TIMEZONE" /etc/localtime
+        echo "$TIMEZONE" > /etc/timezone
+    fi
+    changed "timezone   $TIMEZONE, now $(date +%H:%M) here"
+else
+    note "timezone   $TIMEZONE, now $(date +%H:%M) here"
+fi
+
+#   timer                   when                 catch up at boot
+MAINT_TIMERS="
+    apt-daily.timer         *-*-*_03:00          no     package lists
+    apt-daily-upgrade.timer *-*-*_03:10          no     Debian updates
+    man-db.timer            *-*-*_03:30          no     the manual index
+    logrotate.timer         *-*-*_03:40          yes    log rotation
+    dpkg-db-backup.timer    *-*-*_03:45          yes    dpkg's own backup
+    fstrim.timer            Sun_*-*-*_03:50      no     SD card trim, weekly
+    e2scrub_all.timer       Sun_*-*-*_03:55      no     LVM checks, weekly
+"
+while read -r timer when persist what; do
+    [ -n "$timer" ] || continue
+    unit_exists "$timer" || continue
+    [ "$persist" = yes ] || [ "${MAINT_CATCH_UP:-no}" = yes ] && persist=true || persist=false
+    install_file "/etc/systemd/system/$timer.d/99-ham-radio-pi.conf" <<TIMERCONF
+# ham-radio-pi: $what, between 3 and 4am station time.
+# The empty OnCalendar= clears the packaged schedule rather than adding to it.
+[Timer]
+OnCalendar=
+OnCalendar=${when//_/ }
+RandomizedDelaySec=0
+AccuracySec=1min
+Persistent=$persist
+TIMERCONF
+done <<< "$MAINT_TIMERS"
+systemctl daemon-reload
+while read -r timer when persist what; do
+    [ -n "$timer" ] || continue
+    unit_exists "$timer" || continue
+    if systemctl is-enabled --quiet "$timer" 2>/dev/null; then
+        systemctl start "$timer" >/dev/null 2>&1 || true
+    elif systemctl enable --now "$timer" >/dev/null 2>&1; then
+        changed "enabled    $timer ($what)"
+    else
+        warn "could not enable $timer"
+    fi
+done <<< "$MAINT_TIMERS"
+
+# What apt does when those timers fire. Without these settings apt-daily and
+# apt-daily-upgrade wake up and do nothing. Later files in apt.conf.d win, so
+# this overrides 20auto-upgrades whoever wrote it.
+install_file /etc/apt/apt.conf.d/99ham-radio-pi-periodic <<APTPERIODIC
+// ham-radio-pi: what apt does at 3am, from apt-daily.timer and
+// apt-daily-upgrade.timer. Which updates unattended-upgrades installs is
+// set in 50unattended-upgrades: Debian's security fixes and stable point
+// releases. Nothing is rebooted.
+APT::Periodic::Enable "1";
+APT::Periodic::Update-Package-Lists "1";
+APT::Periodic::Download-Upgradeable-Packages "0";
+APT::Periodic::Unattended-Upgrade "$( [ "$AUTO_UPDATES" = yes ] && echo 1 || echo 0 )";
+APT::Periodic::AutocleanInterval "7";
+// The timer already says when; no extra random wait of up to half an hour.
+APT::Periodic::RandomSleep "0";
+Unattended-Upgrade::Automatic-Reboot "false";
+APTPERIODIC
+if [ "$AUTO_UPDATES" = yes ] && ! have unattended-upgrade && [ "$SKIP_APT" = 0 ]; then
+    warn "unattended-upgrades is not installed, so security updates will not"
+    warn "install themselves; the package lists are still refreshed at 3am."
+fi
 
 # Avahi stays: it is what answers to ${PI_HOSTNAME}.local, which is how the
 # operator's ham-remote configuration finds this machine.
@@ -2151,50 +2282,211 @@ BACKPORTS
     fi
 }
 
-if [ "$INSTALL_EMACS" = yes ]; then
-    head_ "Emacs"
-    install_emacs
-    LISP_DIR="$OP_HOME/.emacs.d/lisp"
-    install -d -o "$OP_USER" -g "$(id -gn "$OP_USER")" -m 0755 "$LISP_DIR"
+# --- the K6SM packages ------------------------------------------------------
+#
+# Each repository is cloned into $K6SM_SRC and brought up to date on every
+# run. A shallow fetch followed by a hard reset follows the repository even
+# when its history has been rewritten, which a "git pull" would refuse to do.
+#
+# Its .el files are then copied into ~/.emacs.d/lisp/<repo>/, leaving out the
+# tests, and byte-compiled. Only the copies are on Emacs's load-path, so a
+# test file in the repository never loads, and a file deleted upstream is
+# deleted here too.
 
-    if [ "$INSTALL_K6SM" = yes ] && have git; then
-        for repo in ham Emacs-QSO-Logger; do
-            target="$LISP_DIR/$repo"
-            if [ -d "$target/.git" ]; then
-                sudo -u "$OP_USER" git -C "$target" pull --quiet --ff-only \
-                    && note "updated    $target" || warn "could not update $target"
-            else
-                if sudo -u "$OP_USER" git clone --quiet --depth 1 \
-                        "https://github.com/K6SM/$repo.git" "$target"; then
-                    changed "cloned     $target"
-                else
-                    warn "Could not clone K6SM/$repo. Check the network and re-run."
-                fi
-            fi
+is_test_file() { # is_test_file <file.el>
+    case "${1##*/}" in
+        test.el|tests.el|test-*.el|tests-*.el|*-test.el|*-tests.el|*-test-*.el|*-tests-*.el)
+            return 0 ;;
+    esac
+    # Or whatever it is called, a file that loads the test framework: no
+    # package does that, and every ERT test file must.
+    grep -q "^(require 'ert)" "$1" 2>/dev/null
+}
+
+k6sm_fetch() { # k6sm_fetch <repo> -- returns 1 if it could not be fetched
+    local repo=$1 src="$K6SM_SRC/$1" out
+    if [ -d "$src/.git" ]; then
+        if ! out=$(git -C "$src" fetch --quiet --depth 1 origin HEAD 2>&1); then
+            printf '%s\n' "$out" | sed 's/^/     /'; return 1
+        fi
+        git -C "$src" reset --quiet --hard FETCH_HEAD || return 1
+        git -C "$src" clean --quiet -fdx || true
+    else
+        rm -rf "$src"
+        mkdir -p "$K6SM_SRC"
+        if ! out=$(git clone --quiet --depth 1 "$K6SM_GITHUB/$repo.git" "$src" 2>&1); then
+            printf '%s\n' "$out" | sed 's/^/     /'; rm -rf "$src"; return 1
+        fi
+    fi
+}
+
+# Before 0.5.3, ~/.emacs.d/lisp/<repo> was itself a git clone. Anything in
+# one that was changed by hand is kept, moved aside; otherwise it goes.
+k6sm_retire_old_clone() { # k6sm_retire_old_clone <dir>
+    local dir=$1 keep
+    [ -d "$dir/.git" ] || return 0
+    # Asked as its owner: git will not read another user's repository.
+    if [ -n "$(sudo -H -u "$OP_USER" git -C "$dir" status --porcelain 2>/dev/null || echo changed)" ]; then
+        keep="$dir.local-changes-$STAMP"
+        mv "$dir" "$keep"
+        warn "$dir had changes made by hand; moved to $keep"
+    else
+        rm -rf "$dir"
+        note "retired    the old git clone in $dir"
+    fi
+}
+
+k6sm_install_repo() { # k6sm_install_repo <repo> -- sets K6SM_CHANGED=1 on changes
+    local repo=$1 src="$K6SM_SRC/$1" dest="$LISP_DIR/$1" f base n=0 skipped=()
+    local -A want=()
+    k6sm_retire_old_clone "$dest"
+    install -d -o "$OP_USER" -g "$OP_GROUP" -m 0755 "$dest"
+    for f in "$src"/*.el; do
+        [ -f "$f" ] || continue
+        base=${f##*/}
+        if is_test_file "$f"; then skipped+=("$base"); continue; fi
+        want[$base]=1
+        n=$((n + 1))
+        if ! cmp -s "$f" "$dest/$base"; then
+            install -m 0644 -o "$OP_USER" -g "$OP_GROUP" "$f" "$dest/$base"
+            K6SM_CHANGED=1
+        fi
+    done
+    # Whatever is here that the repository no longer has.
+    for f in "$dest"/*.el "$dest"/*.elc; do
+        [ -e "$f" ] || continue
+        base=${f##*/}
+        [ -n "${want[${base%c}]:-}" ] && continue
+        rm -f "$f"
+        K6SM_CHANGED=1
+    done
+    K6SM_REVS+=("$repo $(git -C "$src" rev-parse --short HEAD) ($n file$([ "$n" = 1 ] || echo s))")
+    if [ "${#skipped[@]}" -gt 0 ]; then
+        note "skipped    tests in $repo: ${skipped[*]}"
+    fi
+}
+
+install_k6sm_packages() {
+    local repo stamp_file="$LISP_DIR/.ham-radio-pi-compiled" stamp f
+    local dirs=() loadargs=() sources=() failed=()
+    K6SM_CHANGED=0
+    for repo in $K6SM_REPOS; do
+        if k6sm_fetch "$repo"; then
+            k6sm_install_repo "$repo"
+        elif compgen -G "$LISP_DIR/$repo/*.el" >/dev/null; then
+            warn "Could not fetch K6SM/$repo; keeping the copy already installed."
+            K6SM_REVS+=("$repo (not updated)")
+        else
+            warn "Could not fetch K6SM/$repo. Check the network and re-run."
+        fi
+        dirs+=("$LISP_DIR/$repo")
+        loadargs+=(-L "$LISP_DIR/$repo")
+        for f in "$LISP_DIR/$repo"/*.el; do [ -f "$f" ] && sources+=("$f"); done
+    done
+    [ "${#sources[@]}" -gt 0 ] || return 0
+
+    # Byte-compile when the sources or Emacs itself have changed. Compiled,
+    # the packages load several times faster, which a Zero 2W notices.
+    stamp="$(emacs_version) $(cat "${sources[@]}" | sha1sum | cut -c1-12)"
+    if [ "$K6SM_CHANGED" = 1 ] || [ "$(cat "$stamp_file" 2>/dev/null || true)" != "$stamp" ]; then
+        say "byte-compiling the K6SM packages (a minute or two on a Zero 2W)"
+        for f in "${sources[@]}"; do rm -f "${f}c"; done
+        (cd "$LISP_DIR" && sudo -H -u "$OP_USER" nice emacs -Q --batch \
+            "${loadargs[@]}" --eval '(setq byte-compile-warnings nil)' \
+            -f batch-byte-compile "${sources[@]}") >> "$RUN_LOG" 2>&1 || true
+        for f in "${sources[@]}"; do
+            [ -f "${f}c" ] || failed+=("${f##*/}")
         done
+        if [ "${#failed[@]}" -eq 0 ]; then
+            printf '%s\n' "$stamp" > "$stamp_file"
+            chown "$OP_USER:$OP_GROUP" "$stamp_file"
+            changed "compiled   the K6SM packages"
+        else
+            # Emacs loads the .el of anything that did not compile.
+            rm -f "$stamp_file"
+            warn "did not compile: ${failed[*]} -- the details are in $RUN_LOG"
+        fi
+    else
+        note "unchanged  the K6SM packages, already compiled"
+    fi
 
-        INIT="$OP_HOME/.emacs.d/init.el"
-        if [ ! -f "$INIT" ] || ! grep -q 'ham-radio-pi' "$INIT"; then
-            backup_once "$INIT"
-            cat >> "$INIT" <<INITEL
-;; ham-radio-pi: the K6SM packages, and this Pi's own rigctld.
-(add-to-list 'load-path "$LISP_DIR/ham")
-(add-to-list 'load-path "$LISP_DIR/Emacs-QSO-Logger")
+    write_k6sm_init
+
+    # Load them, as the operator's Emacs will, to prove they do.
+    local out
+    if out=$(cd "$OP_HOME" && sudo -H -u "$OP_USER" timeout 120 emacs -Q --batch \
+                 "${loadargs[@]}" --eval "(condition-case err
+                     (progn (require 'adif) (require 'qso) (require 'ham-rig)
+                            (princ \"loaded\"))
+                   (error (princ (error-message-string err)) (kill-emacs 1)))" 2>/dev/null); then
+        ok "adif, qso and ham-rig load: M-x ham-rig and M-x qso-log-form are ready"
+    else
+        warn "The K6SM packages did not all load: ${out:-no message}"
+    fi
+    for f in "${K6SM_REVS[@]}"; do note "installed  $f"; done
+}
+
+write_k6sm_init() {
+    local init="$OP_HOME/.emacs.d/init.el" blk tmp
+    blk=$(mktemp); tmp=$(mktemp); TEMP_FILES+=("$blk" "$tmp")
+    cat > "$blk" <<INITEL
+;; >>> ham-radio-pi -- written by radio-pi-setup.sh, and rewritten by it on
+;; every run. Settings of your own go after the closing marker, where they
+;; take precedence over these.
+(setq load-prefer-newer t)
+;; A compiler running in the background alongside the audio link is not
+;; wanted on a small Pi; the packages are byte-compiled already.
+(when (boundp 'native-comp-jit-compilation)
+  (setq native-comp-jit-compilation nil))
+(dolist (dir '("$LISP_DIR/adif-mode"
+               "$LISP_DIR/Emacs-QSO-Logger"
+               "$LISP_DIR/ham"))
+  (add-to-list 'load-path dir))
+;; This Pi's own rigctld.
 (setq ham-rig-host "127.0.0.1"
       ham-rig-port $RIGCTLD_PORT
       qso-hamlib-enable t
       qso-hamlib-host "127.0.0.1"
       qso-hamlib-port $RIGCTLD_PORT)
+(require 'adif nil t)
 (require 'ham-rig nil t)
 (require 'qso nil t)
+;; <<< ham-radio-pi
 INITEL
-            chown "$OP_USER:$(id -gn "$OP_USER")" "$INIT"
-            changed "wrote      $INIT"
+    if [ -f "$init" ]; then
+        # Our block is replaced where it stands, so that settings after it
+        # still come after it. The one written before 0.5.3 had no end
+        # marker, and ended at (require 'qso nil t).
+        awk -v blk="$blk" '
+            function put() { if (!done) { while ((getline l < blk) > 0) print l; done = 1 } }
+            /^;; >>> ham-radio-pi/                                              { skip = 1; put() }
+            /^;; ham-radio-pi: the K6SM packages, and this Pi.s own rigctld\.$/ { skip = 2; put() }
+            !skip { print }
+            skip == 1 && /^;; <<< ham-radio-pi/                                 { skip = 0 }
+            skip == 2 && /^\(require .qso nil t\)$/                             { skip = 0 }
+            END { if (!done) { if (NR) print ""; put() } }
+        ' "$init" > "$tmp"
+    else
+        cp "$blk" "$tmp"
+    fi
+    install_file "$init" 0644 "$OP_USER:$OP_GROUP" < "$tmp"
+}
+
+if [ "$INSTALL_EMACS" = yes ]; then
+    head_ "Emacs"
+    install_emacs
+    LISP_DIR="$OP_HOME/.emacs.d/lisp"
+    OP_GROUP=$(id -gn "$OP_USER")
+    # Both named, so that .emacs.d is the operator's too if it is new.
+    install -d -o "$OP_USER" -g "$OP_GROUP" -m 0755 "$OP_HOME/.emacs.d" "$LISP_DIR"
+
+    if [ "$INSTALL_K6SM" = yes ]; then
+        if have git; then
+            install_k6sm_packages
         else
-            note "kept       $INIT (already set up)"
+            warn "git is not installed, so the K6SM packages cannot be fetched."
         fi
     fi
-    ok "M-x ham-rig and M-x qso-log-form work on the attached screen"
 fi
 
 # --------------------------------------------------------------------------
@@ -2474,6 +2766,10 @@ fi
 # --------------------------------------------------------------------------
 
 IP=$(hostname -I 2>/dev/null | awk '{print $1}')
+K6SM_SUMMARY="not installed"
+if [ "$INSTALL_K6SM" = yes ] && [ "${#K6SM_REVS[@]}" -gt 0 ]; then
+    K6SM_SUMMARY=$(printf '%s\n' "${K6SM_REVS[@]}" | sed '2,$s/^/                /')
+fi
 
 cat <<SUMMARY
 
@@ -2488,6 +2784,8 @@ $C_HEAD== The station ==$C_OFF
                 out $AUDIO_PLAYBACK
    Reachable at ${PI_HOSTNAME}.local${IP:+ / $IP}
    Emacs        $( if [ "$INSTALL_EMACS" = yes ]; then emacs_version; else echo "not installed"; fi )
+   K6SM Emacs   $K6SM_SUMMARY
+   Maintenance  3-4am $TIMEZONE; Debian updates $( [ "$AUTO_UPDATES" = yes ] && echo automatic || echo "by hand" )
    Wi-Fi watch  $WIFI_WATCHDOG (last-resort reboot: $WIFI_WATCHDOG_REBOOT)
                 after an outage:  sudo ham-radio-pi-wifiwatch --report
 

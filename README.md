@@ -47,6 +47,7 @@ uses.
 - [Hamlib, built from source](#hamlib-built-from-source)
 - [Keeping the Wi-Fi up](#keeping-the-wi-fi-up)
 - [Latency and power](#latency-and-power)
+- [Nightly maintenance](#nightly-maintenance)
 - [Running the script again](#running-the-script-again)
 - [Security](#security)
 - [When it does not work](#when-it-does-not-work)
@@ -143,7 +144,7 @@ screen back.
 **Which version is this?**
 
 ```
-head -2 radio-pi-setup.sh              # radio-pi-setup.sh  version 0.5.2
+head -2 radio-pi-setup.sh              # radio-pi-setup.sh  version 0.5.3
 sudo bash radio-pi-setup.sh --version
 sudo grep LAST_SETUP_VERSION /etc/ham-radio-pi/setup.conf   # which version last ran
 ```
@@ -202,13 +203,18 @@ or behind a VPN.
 may reboot as a last resort. Both default to yes; see
 [Keeping the Wi-Fi up](#keeping-the-wi-fi-up).
 
+**Nightly maintenance.** The station's time zone, and whether Debian's
+security and stable updates install themselves at 3am. See
+[Nightly maintenance](#nightly-maintenance).
+
 **Power and latency.** Covered in [Latency and power](#latency-and-power).
 The defaults are: Wi-Fi power saving off, `ondemand` governor, screen blanking
 after five minutes, Bluetooth off, LEDs off, automatic login on an attached
 screen.
 
-**Emacs.** Whether to install the terminal build, and whether to fetch the
-K6SM `ham.el` and QSO logger packages from GitHub. On Bookworm the terminal
+**Emacs.** Whether to install the terminal build, and whether to install the
+K6SM `ham.el`, QSO logger and ADIF packages from GitHub, which every later run
+then brings up to date; see [The K6SM packages](#the-k6sm-packages). On Bookworm the terminal
 build comes from Debian's backports, because the one Bookworm ships is too
 old for `ham.el`; see [Emacs 29 on Bookworm](#emacs-29-on-bookworm).
 
@@ -390,7 +396,7 @@ not, log in as usual.
 emacs
 ```
 
-opens Emacs in the terminal. If you asked the script to fetch the K6SM
+opens Emacs in the terminal. If you asked the script for the K6SM
 packages, `M-x ham-rig` and `M-x qso-log-form` are ready, already pointed at
 this Pi's own `rigctld` on `127.0.0.1:4532` — which works whichever way you
 answered the "reachable from" question, because that answer only governs the
@@ -402,6 +408,53 @@ daemon owns the serial port and everything else shares it.
 
 The screen blanks after five minutes and comes back on a keypress. That is
 power saving, not a screensaver; nothing is logged out.
+
+### The K6SM packages
+
+Three repositories, all installed and all brought up to date on every run of
+the script:
+
+| Repository | Files | |
+| --- | --- | --- |
+| [K6SM/ham](https://github.com/K6SM/ham) | `ham.el`, `ham-rig.el`, `ham-remote.el`, `ham-spot.el`, … | Rig panel, space weather, spots. Needs Emacs 29.1. |
+| [K6SM/Emacs-QSO-Logger](https://github.com/K6SM/Emacs-QSO-Logger) | `qso.el` | The logging form. |
+| [K6SM/adif-mode](https://github.com/K6SM/adif-mode) | `adif.el` | ADIF fields and values, which the QSO logger now requires, and a mode for `.adi` files. |
+
+How it is done:
+
+- Each repository is cloned into `/usr/local/src/k6sm/<repo>`. A re-run
+  fetches the latest commit on its default branch and resets the clone to
+  it, so it follows the repository even when its history has been rewritten
+  (a `git pull` refuses to).
+- The `.el` files are copied to `~/.emacs.d/lisp/<repo>/`, **leaving out
+  tests**: any file named like `*-test.el`, `*-tests.el` or `test-*.el`, and
+  any file that loads Emacs's test framework (`(require 'ert)`), whatever it
+  is called. Only those copies are on Emacs's load-path. A file deleted from
+  a repository is deleted here too.
+- They are byte-compiled whenever anything changed, including Emacs itself;
+  compiled, they load several times faster on a Zero 2W. A file that does not
+  compile is reported and runs from source.
+- The script then loads `adif`, `qso` and `ham-rig` in a separate Emacs to
+  prove they load, and says so or says why not.
+- `~/.emacs.d/init.el` gets one marked block, between `;; >>> ham-radio-pi`
+  and `;; <<< ham-radio-pi`, which the script rewrites on every run: the
+  load-path, this Pi's `rigctld`, and the three `require`s. Your own settings
+  belong after the closing marker, where they take precedence. Everything
+  outside the block is left alone.
+
+The summary at the end of a run lists the commit of each one installed.
+
+To update them without the rest of the script, a plain re-run is enough —
+it touches nothing else that has not changed:
+
+```
+sudo bash radio-pi-setup.sh --unattended
+```
+
+Before 0.5.3, `~/.emacs.d/lisp/ham` and `~/.emacs.d/lisp/Emacs-QSO-Logger`
+were git clones themselves. The first 0.5.3 run removes them if they are
+unmodified and replaces them with the copies. One with changes made by hand
+is moved aside to `<name>.local-changes-<date>` and reported, not deleted.
 
 ### Emacs 29 on Bookworm
 
@@ -619,7 +672,7 @@ settings are listed in [What the script changes](#what-the-script-changes).
 | Activity LEDs off | | A few milliamps, and the Pi is in a shack, not on a desk. |
 | Journal, capped and batched | 64 MB, synced every 5 min | The journal is kept on disk so that a fault which stops the machine leaves its account behind (`journalctl -b -1`), but capped, and written in batches rather than line by line. `JOURNAL_STORAGE="volatile"` in `setup.conf` puts it back in RAM, sparing the card at the cost of losing it at every reboot. |
 | Later, fewer disk writes | `dirty_writeback_centisecs` | Same reason. |
-| Automatic updates off | | `apt` timers fire at unpredictable times, which is both current and a CPU spike in the middle of a contact. Update by hand; see below. |
+| Maintenance at 3am | | Debian's own timers fire at random times through the day. Here they all run between 3 and 4am instead; see [Nightly maintenance](#nightly-maintenance). |
 | Onboard audio off | | Unless you chose it as the radio's sound device. |
 
 **Not** done, deliberately: the CPU is not underclocked and the maximum clock
@@ -634,6 +687,63 @@ Re-run the script and answer `on` to Wi-Fi power saving, or edit
 first syllable after an over to be late sometimes. The `powersave` governor is
 the other lever, and costs more than it is worth on a board this small.
 
+## Nightly maintenance
+
+Debian keeps itself in order with a handful of systemd timers: refreshing
+the package lists, installing updates, rebuilding the manual index, rotating
+logs, trimming the SD card. Left alone, they fire at random times through the
+day and catch up at boot on anything missed — which is when an operator is
+most likely to be on the air, and on a Zero 2W a package update is audible in
+the link. Before 0.5.3 the script simply turned several of them off.
+
+Now each runs at a fixed time between 3 and 4am, in the station's time zone,
+one at a time so the Pi is never doing two:
+
+| Time | Timer | Does | Catches up at boot |
+| --- | --- | --- | --- |
+| 03:00 daily | `apt-daily` | Refreshes the package lists | no |
+| 03:10 daily | `apt-daily-upgrade` | Installs Debian's updates, if you said yes | no |
+| 03:30 daily | `man-db` | Rebuilds the manual page index | no |
+| 03:40 daily | `logrotate` | Rotates the logs | yes |
+| 03:45 daily | `dpkg-db-backup` | Backs up dpkg's package database | yes |
+| 03:50 Sundays | `fstrim` | Tells the SD card which blocks are free | no |
+| 03:55 Sundays | `e2scrub_all` | Checks ext4 on LVM; nothing, on a Pi | no |
+
+"Catches up at boot: no" means that if the Pi was off at 3am, the job waits
+for the next night rather than running as soon as it boots. The two that do
+catch up take a second or two. If your station is switched off every night,
+the others never run: set `MAINT_CATCH_UP="yes"` in
+`/etc/ham-radio-pi/setup.conf` and re-run with `--unattended`, and they run
+at the next boot instead.
+
+**The time zone** is asked for, because Pi images often come set to London
+or UTC, and "3am" in the wrong one is the middle of someone's evening. The
+answer goes to `timedatectl set-timezone`, so it is the system's time zone,
+and log timestamps follow it. `timedatectl list-timezones` lists the names.
+
+**Automatic updates**, if you say yes: `unattended-upgrades` installs, at
+3:10, what its configuration allows, which on Debian is the security fixes
+and the stable point-release updates for Bookworm. Those are the updates
+Debian considers safe to apply without looking. They do **not** include:
+
+- anything from Raspberry Pi's own archive, which is where the kernel and
+  firmware come from — update those by hand;
+- anything from backports, such as Emacs 29 — `apt upgrade` updates it;
+- Hamlib, which is built from source — a re-run of this script updates it.
+
+Nothing is ever rebooted automatically. A service whose package is updated,
+Mumble's server for instance, is restarted by the update, which at 3am is a
+reconnect nobody hears. Say no to leave all updates to you; the package lists
+are still refreshed nightly, so `apt list --upgradable` is always current.
+
+What happened, afterwards:
+
+```
+systemctl list-timers                              # when each runs next
+journalctl -u apt-daily-upgrade --since yesterday  # what the updates did
+less /var/log/unattended-upgrades/unattended-upgrades.log
+```
+
 ## Running the script again
 
 It is meant to be run again. Everything it does it checks first: packages are
@@ -647,8 +757,8 @@ sudo bash radio-pi-setup.sh --unattended
 sudo reboot
 ```
 
-is the whole upgrade procedure, Hamlib included: if a new stable Hamlib has
-been released, this is when it is built. `--unattended` uses the answers saved last
+is the whole upgrade procedure, Hamlib and the K6SM Emacs packages included:
+if a new stable Hamlib has been released, this is when it is built. `--unattended` uses the answers saved last
 time; leave it off to be asked again, with your previous answers as the
 defaults.
 
@@ -664,10 +774,11 @@ One thing it **does** overwrite: the radio-end Mumble client's configuration,
 change them through `/etc/ham-radio-pi/setup.conf` and a re-run rather than by
 editing the file, or your edits will go the next time you run it.
 
-Because automatic updates are off, updating is something you do. Doing it
+Debian's security and stable updates install themselves at 3am if you said
+yes to them, but everything else — Raspberry Pi's kernel and firmware,
+backports, Hamlib, the K6SM packages — waits for you. Doing that
 deliberately, with a re-run after it and a listen on the band, is better for a
-station that has to work than waking up to a Mumble that changed its audio
-defaults overnight.
+station that has to work than waking up to something that changed overnight.
 
 ## Security
 
@@ -939,9 +1050,14 @@ with the first version kept as `.original`.
 /usr/local/sbin/ham-radio-pi-wifiwatch
 /etc/systemd/system/ham-radio-pi-wifiwatch.service
 /etc/apt/sources.list.d/debian-backports.list Bookworm only, for Emacs 29
+/etc/systemd/system/<timer>.d/99-ham-radio-pi.conf   the 3am schedule, one per timer
+/etc/apt/apt.conf.d/99ham-radio-pi-periodic   what apt does at 3am
+~/.emacs.d/lisp/{ham,Emacs-QSO-Logger,adif-mode}/   the K6SM packages
 ~/.config/Mumble/Mumble.conf                  the radio-end client
 ~/Documents/MumbleAutomaticCertificateBackup.p12
 ```
+
+**Cloned from GitHub**: the K6SM packages, in `/usr/local/src/k6sm/`.
 
 **Installed from source**: Hamlib, under `/usr/local` (`bin/rigctld`,
 `bin/rigctl`, `lib/libhamlib.so.4` and the rest), with the release tarball
@@ -963,16 +1079,21 @@ nothing else uses it.
 /boot/firmware/config.txt   one marked block appended
 /boot/firmware/cmdline.txt  the consoleblank= token
 /etc/hosts                  the 127.0.1.1 line, to match the hostname
+~/.emacs.d/init.el          one marked block
 ```
+
+**Settings it sets**: the time zone, to the one you gave.
 
 **Services it turns off**, if they are there: the desktop login manager,
 `triggerhappy`, `cups`, `ModemManager`, `packagekit`, Bluetooth if you said
-so, and the `apt-daily`, `man-db` and `fstrim` timers.
+so. (Before 0.5.3 it also turned off the `apt-daily`, `man-db` and `fstrim`
+timers; they now run at 3am instead.)
 
 **Services it makes sure are on**: `ssh`, `avahi-daemon` — which is what
 answers to `radio.local`, and why it is not in the list above —
-`mumble-server`, `rigctld`, `mumble-radio`, and `ham-radio-pi-wifiwatch`
-if you asked for it.
+`mumble-server`, `rigctld`, `mumble-radio`, `ham-radio-pi-wifiwatch`
+if you asked for it, and the maintenance timers in
+[Nightly maintenance](#nightly-maintenance).
 
 To undo a piece of it: delete the marked block from `config.txt`, remove the
 `99-ham-radio-pi` files, `systemctl disable --now` the three services, and
@@ -1016,10 +1137,31 @@ up whenever that script changes.
 
 | Script | Version |
 | --- | --- |
-| `radio-pi-setup.sh` | 0.5.2 |
+| `radio-pi-setup.sh` | 0.5.3 |
 | `ham-radio-pi-wifiwatch` (installed by setup) | 0.5.1 |
 | `radio-pi-health.sh` | 0.5.1 |
 | `radio-pi-diagnose.sh` | 0.5.1 |
+
+### radio-pi-setup.sh 0.5.3
+
+- New: installs and, on every run, updates all three K6SM Emacs packages:
+  `ham`, `Emacs-QSO-Logger` and now `adif-mode`, which the QSO logger has
+  required since its recent update (without it, `qso` no longer loads).
+  Test files are left out, the packages are byte-compiled, and the run checks
+  that they load. Updating no longer fails when a repository's history has
+  been rewritten, as `ham`'s recently was. See
+  [The K6SM packages](#the-k6sm-packages).
+- Changed: `apt-daily`, `apt-daily-upgrade`, `man-db`, `fstrim` and
+  `e2scrub_all`, which earlier versions turned off, are back on and run
+  between 3 and 4am; `logrotate` and `dpkg-db-backup` move there too. See
+  [Nightly maintenance](#nightly-maintenance).
+- New questions: the station's time zone, and whether Debian's security and
+  stable updates install themselves at 3am (default yes). An `--unattended`
+  run with answers saved by an earlier version keeps the current time zone
+  and says yes to updates; edit `setup.conf` to change either.
+- New: if apt is busy with the 3am maintenance when the script runs, it waits
+  for it rather than failing.
+- New: the summary shows the K6SM package versions and the maintenance hour.
 
 ### radio-pi-setup.sh 0.5.2
 
